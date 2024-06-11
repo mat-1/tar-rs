@@ -1,4 +1,3 @@
-use std::cell::{Cell, RefCell};
 use std::cmp;
 use std::convert::TryFrom;
 use std::fs;
@@ -6,6 +5,8 @@ use std::io::prelude::*;
 use std::io::{self, SeekFrom};
 use std::marker;
 use std::path::Path;
+use std::sync::atomic::{self, AtomicU64};
+use std::sync::RwLock;
 
 use crate::entry::{EntryFields, EntryIo};
 use crate::error::TarError;
@@ -16,12 +17,15 @@ use crate::{Entry, GnuExtSparseHeader, GnuSparseHeader, Header};
 /// A top-level representation of an archive file.
 ///
 /// This archive can have an entry added to it and it can be iterated over.
-pub struct Archive<R: ?Sized + Read> {
+pub struct Archive<R: ?Sized + Read + Send + Sync> {
     inner: ArchiveInner<R>,
 }
 
-pub struct ArchiveInner<R: ?Sized> {
-    pos: Cell<u64>,
+pub struct ArchiveInner<R: ?Sized>
+where
+    Self: Send + Sync,
+{
+    pos: AtomicU64,
     mask: u32,
     unpack_xattrs: bool,
     preserve_permissions: bool,
@@ -29,11 +33,11 @@ pub struct ArchiveInner<R: ?Sized> {
     preserve_mtime: bool,
     overwrite: bool,
     ignore_zeros: bool,
-    obj: RefCell<R>,
+    obj: RwLock<R>,
 }
 
 /// An iterator over the entries of an archive.
-pub struct Entries<'a, R: 'a + Read> {
+pub struct Entries<'a, R: 'a + Read + Send + Sync> {
     fields: EntriesFields<'a>,
     _ignored: marker::PhantomData<&'a Archive<R>>,
 }
@@ -42,14 +46,14 @@ trait SeekRead: Read + Seek {}
 impl<R: Read + Seek> SeekRead for R {}
 
 struct EntriesFields<'a> {
-    archive: &'a Archive<dyn Read + 'a>,
-    seekable_archive: Option<&'a Archive<dyn SeekRead + 'a>>,
+    archive: &'a Archive<dyn Read + Send + Sync + 'a>,
+    seekable_archive: Option<&'a Archive<dyn SeekRead + Send + Sync + 'a>>,
     next: u64,
     done: bool,
     raw: bool,
 }
 
-impl<R: Read> Archive<R> {
+impl<R: Read + Send + Sync> Archive<R> {
     /// Create a new archive with the underlying object as the reader.
     pub fn new(obj: R) -> Archive<R> {
         Archive {
@@ -61,15 +65,15 @@ impl<R: Read> Archive<R> {
                 preserve_mtime: true,
                 overwrite: true,
                 ignore_zeros: false,
-                obj: RefCell::new(obj),
-                pos: Cell::new(0),
+                obj: RwLock::new(obj),
+                pos: AtomicU64::new(0),
             },
         }
     }
 
     /// Unwrap this archive, returning the underlying object.
     pub fn into_inner(self) -> R {
-        self.inner.obj.into_inner()
+        self.inner.obj.into_inner().unwrap()
     }
 
     /// Construct an iterator over the entries in this archive.
@@ -79,7 +83,7 @@ impl<R: Read> Archive<R> {
     /// iterator returns), then the contents read for each entry may be
     /// corrupted.
     pub fn entries(&mut self) -> io::Result<Entries<R>> {
-        let me: &mut Archive<dyn Read> = self;
+        let me: &mut Archive<dyn Read + Send + Sync> = self;
         me._entries(None).map(|fields| Entries {
             fields: fields,
             _ignored: marker::PhantomData,
@@ -106,7 +110,7 @@ impl<R: Read> Archive<R> {
     /// ar.unpack("foo").unwrap();
     /// ```
     pub fn unpack<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<()> {
-        let me: &mut Archive<dyn Read> = self;
+        let me: &mut Archive<dyn Read + Send + Sync> = self;
         me._unpack(dst.as_ref())
     }
 
@@ -175,7 +179,7 @@ impl<R: Read> Archive<R> {
     }
 }
 
-impl<R: Seek + Read> Archive<R> {
+impl<R: Seek + Read + Send + Sync> Archive<R> {
     /// Construct an iterator over the entries in this archive for a seekable
     /// reader. Seek will be used to efficiently skip over file contents.
     ///
@@ -184,8 +188,8 @@ impl<R: Seek + Read> Archive<R> {
     /// iterator returns), then the contents read for each entry may be
     /// corrupted.
     pub fn entries_with_seek(&mut self) -> io::Result<Entries<R>> {
-        let me: &Archive<dyn Read> = self;
-        let me_seekable: &Archive<dyn SeekRead> = self;
+        let me: &Archive<dyn Read + Send + Sync> = self;
+        let me_seekable: &Archive<dyn SeekRead + Send + Sync> = self;
         me._entries(Some(me_seekable)).map(|fields| Entries {
             fields: fields,
             _ignored: marker::PhantomData,
@@ -193,12 +197,12 @@ impl<R: Seek + Read> Archive<R> {
     }
 }
 
-impl Archive<dyn Read + '_> {
+impl Archive<dyn Read + Send + Sync + '_> {
     fn _entries<'a>(
         &'a self,
-        seekable_archive: Option<&'a Archive<dyn SeekRead + 'a>>,
+        seekable_archive: Option<&'a Archive<dyn SeekRead + Send + Sync + 'a>>,
     ) -> io::Result<EntriesFields<'a>> {
-        if self.inner.pos.get() != 0 {
+        if self.inner.pos.load(atomic::Ordering::Relaxed) != 0 {
             return Err(other(
                 "cannot call entries unless archive is at \
                  position 0",
@@ -246,7 +250,7 @@ impl Archive<dyn Read + '_> {
     }
 }
 
-impl<'a, R: Read> Entries<'a, R> {
+impl<'a, R: Read + Send + Sync> Entries<'a, R> {
     /// Indicates whether this iterator will return raw entries or not.
     ///
     /// If the raw list of entries are returned, then no preprocessing happens
@@ -262,7 +266,7 @@ impl<'a, R: Read> Entries<'a, R> {
         }
     }
 }
-impl<'a, R: Read> Iterator for Entries<'a, R> {
+impl<'a, R: Read + Send + Sync> Iterator for Entries<'a, R> {
     type Item = io::Result<Entry<'a, R>>;
 
     fn next(&mut self) -> Option<io::Result<Entry<'a, R>>> {
@@ -281,7 +285,7 @@ impl<'a> EntriesFields<'a> {
         let mut header_pos = self.next;
         loop {
             // Seek to the start of the next header in the archive
-            let delta = self.next - self.archive.inner.pos.get();
+            let delta = self.next - self.archive.inner.pos.load(atomic::Ordering::Relaxed);
             self.skip(delta)?;
 
             // EOF is an indicator that we are at the end of the archive.
@@ -577,18 +581,18 @@ impl<'a> Iterator for EntriesFields<'a> {
     }
 }
 
-impl<'a, R: ?Sized + Read> Read for &'a ArchiveInner<R> {
+impl<'a, R: ?Sized + Read + Send + Sync> Read for &'a ArchiveInner<R> {
     fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
-        let i = self.obj.borrow_mut().read(into)?;
-        self.pos.set(self.pos.get() + i as u64);
+        let i = self.obj.write().unwrap().read(into)?;
+        self.pos.fetch_add(i as u64, atomic::Ordering::Relaxed);
         Ok(i)
     }
 }
 
-impl<'a, R: ?Sized + Seek> Seek for &'a ArchiveInner<R> {
+impl<'a, R: ?Sized + Seek + Send + Sync> Seek for &'a ArchiveInner<R> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let pos = self.obj.borrow_mut().seek(pos)?;
-        self.pos.set(pos);
+        let pos = self.obj.write().unwrap().seek(pos)?;
+        self.pos.store(pos, atomic::Ordering::Relaxed);
         Ok(pos)
     }
 }
